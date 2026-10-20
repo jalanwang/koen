@@ -174,6 +174,7 @@ namespace KoEnCaret
         readonly System.Windows.Forms.Timer timer;
         bool? lastKorean;
         bool visible;
+        int uiaSkip; // ticks to wait before trying the UI Automation fallback again
 
         public App()
         {
@@ -233,15 +234,19 @@ namespace KoEnCaret
             return true;
         }
 
-        // Vertical centre of the focused element's text selection (the caret), via UI Automation.
-        static bool UiaCaretMidY(out int midY)
+        // Screen rectangle of the focused element's text selection (the caret), via UI Automation.
+        // Also returns the bounds of the focused element itself (e.g. the address bar field).
+        static bool UiaCaretRect(out Rectangle caret, out Rectangle element, bool editOnly = false)
         {
-            midY = 0;
+            caret = Rectangle.Empty;
+            element = Rectangle.Empty;
             try
             {
                 System.Windows.Automation.AutomationElement fe = System.Windows.Automation.AutomationElement.FocusedElement;
                 object pattern;
-                if (fe == null || !fe.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern, out pattern))
+                if (fe == null) return false;
+                if (editOnly && fe.Current.ControlType != System.Windows.Automation.ControlType.Edit) return false;
+                if (!fe.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern, out pattern))
                     return false;
                 System.Windows.Automation.Text.TextPatternRange[] sel =
                     ((System.Windows.Automation.TextPattern)pattern).GetSelection();
@@ -249,8 +254,12 @@ namespace KoEnCaret
                 System.Windows.Rect[] rects = sel[0].GetBoundingRectangles();
                 if (rects.Length == 0) return false;
                 System.Windows.Rect r = rects[0];
-                if (double.IsInfinity(r.Y) || double.IsNaN(r.Y) || double.IsInfinity(r.Height)) return false;
-                midY = (int)(r.Y + r.Height / 2);
+                if (double.IsInfinity(r.X) || double.IsNaN(r.X) || double.IsInfinity(r.Y) || double.IsNaN(r.Y) ||
+                    double.IsInfinity(r.Height) || r.Height <= 0) return false;
+                caret = new Rectangle((int)r.X, (int)r.Y, (int)Math.Max(1, r.Width), (int)r.Height);
+                System.Windows.Rect eb = fe.Current.BoundingRectangle;
+                if (!double.IsInfinity(eb.X) && !double.IsNaN(eb.X) && !double.IsInfinity(eb.Width) && eb.Width > 0)
+                    element = new Rectangle((int)eb.X, (int)eb.Y, (int)eb.Width, (int)eb.Height);
                 return true;
             }
             catch { return false; }
@@ -305,6 +314,7 @@ namespace KoEnCaret
             // 1) classic Win32 caret
             bool have = false;
             int x = 0, top = 0, height = 0;
+            int msaaWidth = -1; // stays -1 unless the caret came from MSAA
             if (gti.hwndCaret != IntPtr.Zero)
             {
                 Native.POINT p;
@@ -336,11 +346,31 @@ namespace KoEnCaret
                             x = l;
                             top = t;
                             height = chh;
+                            msaaWidth = cw;
                             have = true;
                         }
                     }
                 }
                 catch { }
+            }
+
+            // 3) UI Automation (XAML/WinUI text boxes such as the taskbar search box, which
+            //    expose neither a Win32 caret nor an MSAA one). Throttled when it keeps failing.
+            if (!have)
+            {
+                if (uiaSkip > 0) uiaSkip--;
+                else
+                {
+                    Rectangle real, field;
+                    if (UiaCaretRect(out real, out field, true))
+                    {
+                        x = real.X;
+                        top = real.Y;
+                        height = real.Height;
+                        have = true;
+                    }
+                    else uiaSkip = 5;
+                }
             }
 
             if (!have) { Hide(); return; }
@@ -357,24 +387,49 @@ namespace KoEnCaret
             if (!view.IsEmpty)
             {
                 int midY = top + height / 2;
-                if (x < view.Left || x > view.Right || midY < view.Top || midY >= view.Bottom)
+                if (chromium && midY < view.Top)
                 {
-                    Hide();
-                    return;
-                }
-                // Chromium clamps the MSAA caret to the viewport edge when its line is scrolled
-                // away. When the caret sits on an edge, ask UI Automation for the real position.
-                if (chromium && (top <= view.Top + 2 || top + height >= view.Bottom - 2))
-                {
-                    int realMidY;
-                    if (UiaCaretMidY(out realMidY) && (realMidY < view.Top || realMidY >= view.Bottom))
+                    // Browser UI above the page (address bar, ...): MSAA gives a stale position
+                    // here, so take the caret from UI Automation and require it to be in that UI.
+                    Rectangle real, field, frame;
+                    if (!UiaCaretRect(out real, out field) || real.Y + real.Height / 2 >= view.Top ||
+                        !ClientScreenRect(fg, out frame) || !frame.Contains(real.X, real.Y + real.Height / 2))
                     {
                         Hide();
                         return;
                     }
+                    x = real.X;
+                    top = real.Y;
+                    height = real.Height;
+                }
+                else
+                {
+                    // Chromium keeps reporting the last caret position with width 0 once focus is
+                    // no longer in a text field (e.g. after switching tabs): there is no caret.
+                    if (chromium && msaaWidth == 0)
+                    {
+                        Hide();
+                        return;
+                    }
+                    if (x < view.Left || x > view.Right || midY < view.Top || midY >= view.Bottom)
+                    {
+                        Hide();
+                        return;
+                    }
+                    // Chromium clamps the MSAA caret to the viewport edge when its line is scrolled
+                    // away. When the caret sits on an edge, ask UI Automation for the real position.
+                    if (chromium && (top <= view.Top + 2 || top + height >= view.Bottom - 2))
+                    {
+                        Rectangle real, field;
+                        if (UiaCaretRect(out real, out field) &&
+                            (real.Y + real.Height / 2 < view.Top || real.Y + real.Height / 2 >= view.Bottom))
+                        {
+                            Hide();
+                            return;
+                        }
+                    }
                 }
             }
-            int y = top + height;
 
             // Hangul / English state
             bool korean = false;
@@ -400,7 +455,14 @@ namespace KoEnCaret
                 SetTray(korean);
             }
 
-            Native.SetWindowPos(overlay.Handle, Native.HWND_TOPMOST, x + 2, y, w, h,
+            // Flag follows the caret: just right of it, below the line (above it when there is
+            // no room below, e.g. the taskbar search box at the bottom of the screen).
+            Rectangle screen = Screen.FromPoint(new Point(x, top)).Bounds;
+            int fx = Math.Max(screen.Left, Math.Min(x + 2, screen.Right - w));
+            int fy = top + height;
+            if (fy + h > screen.Bottom) fy = top - h;
+            fy = Math.Max(screen.Top, Math.Min(fy, screen.Bottom - h));
+            Native.SetWindowPos(overlay.Handle, Native.HWND_TOPMOST, fx, fy, w, h,
                 Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
             visible = true;
         }
