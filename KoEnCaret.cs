@@ -299,16 +299,49 @@ namespace KoEnCaret
             }
         }
 
+        // Optional diagnostics: create %LOCALAPPDATA%\KoEnCaret\debug.flag to log every decision
+        // (state changes only) to debug.log in the same folder.
+        static readonly string DbgDir = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KoEnCaret");
+        bool dbgOn;
+        int dbgTicks;
+        string lastDbg;
+
+        void Dbg(string s)
+        {
+            if (!dbgOn || s == lastDbg) return;
+            lastDbg = s;
+            try
+            {
+                System.IO.File.AppendAllText(System.IO.Path.Combine(DbgDir, "debug.log"),
+                    DateTime.Now.ToString("HH:mm:ss.fff ") + s + "\r\n");
+            }
+            catch { }
+        }
+
+        static string ClassOf(IntPtr h)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(128);
+            Native.GetClassName(h, sb, 128);
+            return sb.ToString();
+        }
+
         void Tick()
         {
+            if (dbgTicks-- <= 0)
+            {
+                dbgTicks = 20;
+                dbgOn = System.IO.File.Exists(System.IO.Path.Combine(DbgDir, "debug.flag"));
+            }
+
             IntPtr fg = Native.GetForegroundWindow();
-            if (fg == IntPtr.Zero) { Hide(); return; }
+            if (fg == IntPtr.Zero) { Dbg("hide: no foreground window"); Hide(); return; }
 
             uint pid;
             uint tid = Native.GetWindowThreadProcessId(fg, out pid);
             Native.GUITHREADINFO gti = new Native.GUITHREADINFO();
             gti.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
-            if (!Native.GetGUIThreadInfo(tid, ref gti)) { Hide(); return; }
+            if (!Native.GetGUIThreadInfo(tid, ref gti)) { Dbg("hide: GetGUIThreadInfo failed"); Hide(); return; }
             IntPtr focus = gti.hwndFocus != IntPtr.Zero ? gti.hwndFocus : fg;
 
             // 1) classic Win32 caret
@@ -373,7 +406,9 @@ namespace KoEnCaret
                 }
             }
 
-            if (!have) { Hide(); return; }
+            if (dbgOn)
+                Dbg(string.Format("fg={0} have={1} caret=({2},{3}) h={4} msaaW={5}", ClassOf(fg), have, x, top, height, msaaWidth));
+            if (!have) { Dbg("hide: no caret from Win32/MSAA/UIA (fg=" + ClassOf(fg) + ")"); Hide(); return; }
 
             // The caret line may have been scrolled out of view: hide when the caret
             // is outside the visible area of the window that owns it. For Chromium-based
@@ -413,6 +448,7 @@ namespace KoEnCaret
                     }
                     if (x < view.Left || x > view.Right || midY < view.Top || midY >= view.Bottom)
                     {
+                        Dbg(string.Format("hide: caret ({0},{1}) outside view {2}", x, midY, view));
                         Hide();
                         return;
                     }
@@ -455,16 +491,20 @@ namespace KoEnCaret
                 SetTray(korean);
             }
 
-            // Flag follows the caret: just right of it, below the line (above it when there is
-            // no room below, e.g. the taskbar search box at the bottom of the screen).
-            Rectangle screen = Screen.FromPoint(new Point(x, top)).Bounds;
+            // Flag follows the caret: just right of it, below the line. When there is no room
+            // below within the work area, go above the caret; a caret inside the taskbar (its
+            // search box) gets the flag right above the taskbar, which would otherwise cover it.
+            Screen scr = Screen.FromPoint(new Point(x, top));
+            Rectangle screen = scr.Bounds, work = scr.WorkingArea;
             int fx = Math.Max(screen.Left, Math.Min(x + 2, screen.Right - w));
             int fy = top + height;
-            if (fy + h > screen.Bottom) fy = top - h;
+            if (fy + h > work.Bottom) fy = Math.Min(top - h, work.Bottom - h);
             fy = Math.Max(screen.Top, Math.Min(fy, screen.Bottom - h));
             Native.SetWindowPos(overlay.Handle, Native.HWND_TOPMOST, fx, fy, w, h,
                 Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
             visible = true;
+            if (dbgOn)
+                Dbg(string.Format("show at ({0},{1}) korean={2} screen={3} fg={4}", fx, fy, korean, screen, ClassOf(fg)));
         }
 
         protected override void ExitThreadCore()
