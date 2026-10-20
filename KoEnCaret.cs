@@ -36,6 +36,11 @@ namespace KoEnCaret
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
         [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT pt);
+        [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder sb, int max);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+        public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWnd, EnumProc cb, IntPtr lParam);
         [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint idThread);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
@@ -215,6 +220,67 @@ namespace KoEnCaret
             tray.Text = korean ? "KoEnCaret - 한글" : "KoEnCaret - English";
         }
 
+        static bool ClientScreenRect(IntPtr hwnd, out Rectangle rect)
+        {
+            rect = Rectangle.Empty;
+            Native.RECT cr;
+            if (!Native.GetClientRect(hwnd, out cr) || cr.right <= cr.left || cr.bottom <= cr.top) return false;
+            Native.POINT tl;
+            tl.x = cr.left;
+            tl.y = cr.top;
+            if (!Native.ClientToScreen(hwnd, ref tl)) return false;
+            rect = new Rectangle(tl.x, tl.y, cr.right - cr.left, cr.bottom - cr.top);
+            return true;
+        }
+
+        // Vertical centre of the focused element's text selection (the caret), via UI Automation.
+        static bool UiaCaretMidY(out int midY)
+        {
+            midY = 0;
+            try
+            {
+                System.Windows.Automation.AutomationElement fe = System.Windows.Automation.AutomationElement.FocusedElement;
+                object pattern;
+                if (fe == null || !fe.TryGetCurrentPattern(System.Windows.Automation.TextPattern.Pattern, out pattern))
+                    return false;
+                System.Windows.Automation.Text.TextPatternRange[] sel =
+                    ((System.Windows.Automation.TextPattern)pattern).GetSelection();
+                if (sel.Length == 0) return false;
+                System.Windows.Rect[] rects = sel[0].GetBoundingRectangles();
+                if (rects.Length == 0) return false;
+                System.Windows.Rect r = rects[0];
+                if (double.IsInfinity(r.Y) || double.IsNaN(r.Y) || double.IsInfinity(r.Height)) return false;
+                midY = (int)(r.Y + r.Height / 2);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // Chromium (Chrome, Edge, Electron apps): largest visible render widget = page viewport.
+        static bool FindChromiumViewport(IntPtr top, out Rectangle best)
+        {
+            Rectangle found = Rectangle.Empty;
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(64);
+            Native.GetClassName(top, sb, 64);
+            if (!sb.ToString().StartsWith("Chrome_WidgetWin"))
+            {
+                best = Rectangle.Empty;
+                return false;
+            }
+            Native.EnumChildWindows(top, delegate(IntPtr child, IntPtr lp)
+            {
+                System.Text.StringBuilder cls = new System.Text.StringBuilder(64);
+                Native.GetClassName(child, cls, 64);
+                Rectangle r;
+                if (cls.ToString() == "Chrome_RenderWidgetHostHWND" && Native.IsWindowVisible(child) &&
+                    ClientScreenRect(child, out r) && r.Width * r.Height > found.Width * found.Height)
+                    found = r;
+                return true;
+            }, IntPtr.Zero);
+            best = found;
+            return !found.IsEmpty;
+        }
+
         void Hide()
         {
             if (visible)
@@ -238,7 +304,7 @@ namespace KoEnCaret
 
             // 1) classic Win32 caret
             bool have = false;
-            int x = 0, y = 0;
+            int x = 0, top = 0, height = 0;
             if (gti.hwndCaret != IntPtr.Zero)
             {
                 Native.POINT p;
@@ -246,9 +312,9 @@ namespace KoEnCaret
                 p.y = gti.rcCaret.top;
                 if (Native.ClientToScreen(gti.hwndCaret, ref p))
                 {
-                    int ch = gti.rcCaret.bottom - gti.rcCaret.top;
                     x = p.x;
-                    y = p.y + ch;
+                    top = p.y;
+                    height = gti.rcCaret.bottom - gti.rcCaret.top;
                     have = true;
                 }
             }
@@ -268,7 +334,8 @@ namespace KoEnCaret
                         if (chh > 0 && (l != 0 || t != 0))
                         {
                             x = l;
-                            y = t + chh;
+                            top = t;
+                            height = chh;
                             have = true;
                         }
                     }
@@ -277,6 +344,37 @@ namespace KoEnCaret
             }
 
             if (!have) { Hide(); return; }
+
+            // The caret line may have been scrolled out of view: hide when the caret
+            // is outside the visible area of the window that owns it. For Chromium-based
+            // apps the focus window is the whole frame (tabs, toolbar included), so use the
+            // page viewport (Chrome_RenderWidgetHostHWND) instead.
+            IntPtr owner = gti.hwndCaret != IntPtr.Zero ? gti.hwndCaret : focus;
+            Rectangle view;
+            bool chromium = FindChromiumViewport(fg, out view);
+            if (!chromium && !ClientScreenRect(owner, out view))
+                view = Rectangle.Empty;
+            if (!view.IsEmpty)
+            {
+                int midY = top + height / 2;
+                if (x < view.Left || x > view.Right || midY < view.Top || midY >= view.Bottom)
+                {
+                    Hide();
+                    return;
+                }
+                // Chromium clamps the MSAA caret to the viewport edge when its line is scrolled
+                // away. When the caret sits on an edge, ask UI Automation for the real position.
+                if (chromium && (top <= view.Top + 2 || top + height >= view.Bottom - 2))
+                {
+                    int realMidY;
+                    if (UiaCaretMidY(out realMidY) && (realMidY < view.Top || realMidY >= view.Bottom))
+                    {
+                        Hide();
+                        return;
+                    }
+                }
+            }
+            int y = top + height;
 
             // Hangul / English state
             bool korean = false;
